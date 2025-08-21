@@ -12,6 +12,7 @@ from typing import Optional
 
 import crema
 import fire
+import joblib
 import pandas as pd
 import pyteomics.mgf
 import pyteomics.mzml
@@ -31,12 +32,12 @@ def setup_logging(log_dir: Optional[PathLike] = None) -> None:
     """Configure logging for the topdown-convert pipeline."""
     dt_str = datetime.datetime.now().strftime("%Y%d%m")
     log_filename = f"top-down-convert-{dt_str}.log"
-    
+
     if log_dir is None:
         log_dir = pathlib.Path.cwd()
     else:
         log_dir = pathlib.Path(log_dir)
-    
+
     log_path = log_dir / log_filename
 
     logging.basicConfig(
@@ -184,7 +185,7 @@ def get_filtered_mgf(msf_path: PathLike) -> pd.DataFrame:
     -------
     pd.DataFrame
         Filtered PSM DataFrame used to generate the MGF file.
-    """ 
+    """
     msf_path = pathlib.Path(msf_path)
     mzml_path = msf_path.with_suffix(".mzML")
     mgf_path = msf_path.with_suffix(".mgf")
@@ -274,7 +275,7 @@ def run_ms_convert(raw_file: PathLike) -> pathlib.Path:
         "exec",
         "-B",
         f"{raw_file_dir}:/data",
-        "msconvert.sif",
+        "~/msconvert.sif",
         "wine",
         "msconvert",
         f"data/{raw_file.name}",
@@ -292,53 +293,148 @@ def run_ms_convert(raw_file: PathLike) -> pathlib.Path:
     return raw_file.with_suffix(".mzML")
 
 
-def convert_ftp(
+def get_ms_run_ftp(
+    ftp_url: str,
+    msf_file: PathLike,
+    output_dir: PathLike,
+    tmp_dir_path: Optional[PathLike] = None,
+    ftp_username: str = "",
+    ftp_password: str = "",
+    save_psm_table: bool = True,
+) -> Optional[pd.DataFrame]:
+    """
+    Download and process a single mass spectrometry run from an FTP server.
+
+    Parameters
+    ----------
+    ftp_url : str
+        Hostname of the FTP server.
+    msf_file : PathLike
+        Path to the `.msf` file on the FTP server.
+    output_dir : PathLike
+        Local directory where `.mgf` files and PSM tables are written.
+    tmp_dir_path : PathLike, optional
+        Directory for temporary storage of downloaded files.
+        Defaults to the system temp directory.
+    ftp_username : str, default=""
+        Username for FTP authentication.
+    ftp_password : str, default=""
+        Password for FTP authentication.
+    save_psm_table : bool, default=True
+        Whether to save the PSM info table to disk as Parquet.
+
+    Returns
+    -------
+    pandas.DataFrame or None
+        The extracted PSM table if conversion succeeds, otherwise None.
+    """
+    if tmp_dir_path is None:
+        tmp_dir_path = tempfile.gettempdir()
+
+    output_dir = pathlib.Path(output_dir)
+    tmp_dir_path = pathlib.Path(tmp_dir_path)
+    msf_file = pathlib.Path(msf_file)
+    ftp_path = msf_file.parent
+    psm_data_table = None
+
+    mgf_dir = output_dir / "mgf-data"
+    mgf_dir.mkdir(parents=True, exist_ok=True)
+    logging.info(f"Writing MGF file to: {mgf_dir}")
+
+    with ftplib.FTP(ftp_url) as ftp:
+        ftp.login(user=ftp_username, passwd=ftp_password)
+        logging.info("Logged into FTP server successfully.")
+
+        ftp.cwd(str(ftp_path))
+        logging.info(f"Changed directory to: {ftp_path}")
+
+        try:
+            msf_file = pathlib.Path(msf_file)
+            raw_file = msf_file.with_suffix(".raw")
+            logging.info(
+                f"Processing MS run: {msf_file.name}, expecting RAW file: "
+                f" {raw_file.name}"
+            )
+
+            folder_name = msf_file.stem
+            curr_tmp_dir = tmp_dir_path / folder_name
+            curr_tmp_dir.mkdir(parents=True, exist_ok=True)
+
+            for file in [msf_file, raw_file]:
+                logging.info(f"Downloading {file.name} from FTP to {curr_tmp_dir}")
+                with open(curr_tmp_dir / file.name, "wb") as f:
+                    ftp.retrbinary(f"RETR {file.name}", f.write)
+
+            raw_file = curr_tmp_dir / raw_file.name
+            msf_file = curr_tmp_dir / msf_file.name
+            logging.info(f"Running msconvert on {raw_file}")
+            run_ms_convert(raw_file)
+
+            logging.info(f"Filtering and extracting MGF for {msf_file}")
+            psm_data_table = get_filtered_mgf(msf_file)
+
+            mgf_file = msf_file.with_suffix(".mgf")
+            shutil.copy(mgf_file, mgf_dir / mgf_file.name)
+            logging.info(f"Copied MGF file to {mgf_dir / mgf_file.name}")
+        except Exception:
+            logging.exception(f"Failed to convert MS run {msf_file}")
+        finally:
+            shutil.rmtree(curr_tmp_dir)
+
+    if not save_psm_table:
+        return psm_data_table
+
+    if psm_data_table is None:
+        logging.warning("Not saving PSM info table due to conversion error")
+    else:
+        data_table_dir = output_dir / "psm-tables"
+        data_table_dir.mkdir(exist_ok=True, parents=True)
+        data_table_path = data_table_dir / msf_file.with_suffix(".parquet").name
+        logging.info(f"Saving PSM info table to {data_table_path}")
+        psm_data_table.to_parquet(data_table_path)
+
+    return psm_data_table
+
+
+def get_ms_directory_ftp(
     ftp_url: str,
     ftp_path: PathLike,
     output_dir: PathLike,
     tmp_dir_path: Optional[PathLike] = None,
     ftp_username: str = "",
     ftp_password: str = "",
+    n_jobs: Optional[int] = None,
 ) -> None:
     """
-    Download MSF/RAW files from an FTP server and convert them into MGFs.
+    Download and process all MSF-based runs from a directory on an FTP server.
 
     Parameters
     ----------
     ftp_url : str
         Hostname of the FTP server.
     ftp_path : PathLike
-        Remote directory on the FTP server containing MSF/RAW files.
+        Remote directory on the FTP server containing `.msf` and `.raw` files.
     output_dir : PathLike
-        Local output directory to store MGFs and summary table.
+        Local directory where `.mgf` files, PSM tables, and logs are written.
     tmp_dir_path : PathLike, optional
-        Local temporary directory for intermediate files.
-        Defaults to system temp dir.
+        Local temporary directory for intermediate files. Defaults to the
+        system temp directory.
     ftp_username : str, default=""
-        FTP username, if authentication is required.
+        Username for FTP authentication.
     ftp_password : str, default=""
-        FTP password, if authentication is required.
+        Password for FTP authentication.
+    n_jobs : int, optional
+        Number of parallel jobs to use for downloading and processing files.
+        If None, runs sequentially.
 
     Returns
     -------
     None
-        Writes MGF files and a summary PSM table to the output directory.
     """
     output_dir = pathlib.Path(output_dir)
     log_dir = output_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     setup_logging(log_dir)
-    
-    if tmp_dir_path is None:
-        tmp_dir_path = tempfile.gettempdir()
-
-    ftp_path = pathlib.Path(ftp_path)
-    tmp_dir_path = pathlib.Path(tmp_dir_path)
-    psm_data_table = list()
-
-    mgf_dir = output_dir / "mgf-data"
-    mgf_dir.mkdir(parents=True, exist_ok=True)
-    logging.info(f"Writing MGF files to: {mgf_dir}")
 
     logging.info(f"Connecting to FTP server: {ftp_url}")
     with ftplib.FTP(ftp_url) as ftp:
@@ -347,60 +443,35 @@ def convert_ftp(
 
         ftp.cwd(str(ftp_path))
         logging.info(f"Changed directory to: {ftp_path}")
-
         msf_files = [f for f in ftp.nlst() if f.lower().endswith(".msf")]
-        logging.info(f"Found {len(msf_files)} MSF file(s)")
 
-        for msf_file in msf_files:
-            try:
-                msf_file = pathlib.Path(msf_file)
-                raw_file = msf_file.with_suffix(".raw")
-                logging.info(
-                    f"Processing MS run: {msf_file.name}, expecting RAW file: "
-                    f" {raw_file.name}"
-                )
+    logging.info(f"Found {len(msf_files)} MSF file(s) under {ftp_path}")
+    for msf_file in msf_files:
+        logging.info(f"  {msf_file}")
 
-                folder_name = msf_file.stem
-                curr_tmp_dir = tmp_dir_path / folder_name
-                curr_tmp_dir.mkdir(parents=True, exist_ok=True)
-
-                for file in [msf_file, raw_file]:
-                    logging.info(f"Downloading {file.name} from FTP to {curr_tmp_dir}")
-                    with open(curr_tmp_dir / file.name, "wb") as f:
-                        ftp.retrbinary(f"RETR {file.name}", f.write)
-
-                raw_file = curr_tmp_dir / raw_file.name
-                msf_file = curr_tmp_dir / msf_file.name
-                logging.info(f"Running msconvert on {raw_file}")
-                run_ms_convert(raw_file)
-
-                logging.info(f"Filtering and extracting MGF for {msf_file}")
-                psm_data_table.append(get_filtered_mgf(msf_file))
-
-                mgf_file = msf_file.with_suffix(".mgf")
-                shutil.copy(mgf_file, mgf_dir / mgf_file.name)
-                logging.info(f"Copied MGF file to {mgf_dir / mgf_file.name}")
-
-            except Exception:
-                logging.exception(f"Failed to convert MS run {msf_file}")
-            finally:
-                shutil.rmtree(curr_tmp_dir)
-
-    if psm_data_table:
-        psm_info_path = output_dir / "psm-info.parquet"
-        logging.info(
-            f"Writing PSM info table with {len(psm_data_table)} runs to: "
-            f"{psm_info_path}"
+    joblib.Parallel(n_jobs=n_jobs, prefer="threads", batch_size=1)(
+        joblib.delayed(get_ms_run_ftp)(
+            ftp_url,
+            ftp_path / msf_file,
+            output_dir,
+            tmp_dir_path=tmp_dir_path,
+            ftp_username=ftp_username,
+            ftp_password=ftp_password,
         )
-        psm_data_table = pd.concat(psm_data_table)
-        psm_data_table.to_parquet(psm_info_path)
-    else:
-        logging.warning("PSM table is empty - no PSM table will be written.")
+        for msf_file in msf_files
+    )
 
 
 def main():
     """CLI Entry"""
-    fire.Fire({"single-run": get_filtered_mgf, "ftp": convert_ftp})
+    fire.Fire(
+        {
+            "single-local": get_filtered_mgf,
+            "single-ftp": get_ms_run_ftp,
+            "dir-ftp": get_ms_directory_ftp,
+        }
+    )
+
 
 if __name__ == "__main__":
     main()
