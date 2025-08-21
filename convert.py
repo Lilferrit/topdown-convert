@@ -2,6 +2,7 @@ import dataclasses
 import datetime
 import ftplib
 import logging
+import os
 import pathlib
 import re
 import shutil
@@ -255,7 +256,7 @@ def run_ms_convert(raw_file: PathLike) -> pathlib.Path:
     Invokes the ``msconvert`` command wrapped in a Singularity/Apptainer
     container. The RAW file is bind-mounted into the container and converted to
     a compressed, peak-picked mzML file. Assumes the container file is at the
-    path ~/msconvert.sif.
+    path ~/msconvert.sif if the envar MSCONVERT_SIF_PATH is not set.
 
     Parameters
     ----------
@@ -269,13 +270,14 @@ def run_ms_convert(raw_file: PathLike) -> pathlib.Path:
     """
     raw_file = pathlib.Path(raw_file)
     raw_file_dir = raw_file.parent
+    sif_path = os.environ.get("MSCONVERT_SIF_PATH", "~/msconvert.sif")
 
     cmd = [
         "apptainer",
         "exec",
         "-B",
         f"{raw_file_dir}:/data",
-        "~/msconvert.sif",
+        f"{sif_path}",
         "wine",
         "msconvert",
         f"data/{raw_file.name}",
@@ -288,8 +290,25 @@ def run_ms_convert(raw_file: PathLike) -> pathlib.Path:
         "--filter",
         "peakPicking true 1-",
     ]
+    
+    logging.info("Running command: %s", " ".join(cmd))
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
+    )
 
-    subprocess.run(cmd, check=True)
+    # Stream each line into logging
+    with process.stdout:
+        for line in process.stdout:
+            logging.info(line.strip())
+
+    retcode = process.wait()
+    if retcode != 0:
+        raise subprocess.CalledProcessError(retcode, cmd)
+
     return raw_file.with_suffix(".mzML")
 
 
