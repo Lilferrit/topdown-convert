@@ -37,6 +37,12 @@ Because the CLI is powered by `fire`, you call functions as subcommands with nam
 * **PSM tables (Parquet):** `./<output_dir>/psm-tables/*.parquet`
 * **Logs:** `./<output_dir>/logs/top-down-convert-YYYYDDMM.log`
 
+## Environmental Variables
+
+The following environmental variables can be changed to effect the behavior of the script:
+
+- `TDC_SE_SCORE_COL`: the search engine score column, defaults to `LogPScore`
+- `TDC_MSCONVERT_SIF_PATH`: the path to the msconvert container .sif file, defaults to: `~/msconvert.sif`.
 
 ## Commands
 

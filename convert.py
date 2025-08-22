@@ -21,6 +21,8 @@ import tqdm
 
 PathLike = pathlib.Path | str
 
+SCORE_COLUMN = os.getenv("TDC_SE_SCORE_COL", default="LogPScore")
+MSCONVERT_SIF_PATH = os.getenv("TDC_MSCONVERT_SIF_PATH", default="~/msconvert.sif")
 
 @dataclasses.dataclass
 class PsmInfo:
@@ -29,23 +31,52 @@ class PsmInfo:
     sequence: str
 
 
-def setup_logging(log_dir: Optional[PathLike] = None) -> None:
-    """Configure logging for the topdown-convert pipeline."""
-    dt_str = datetime.datetime.now().strftime("%Y%d%m")
-    log_filename = f"top-down-convert-{dt_str}.log"
+def setup_logging(
+    log_dir: Optional[PathLike] = None,
+    to_file: bool = True,
+    filename: Optional[str] = None,
+) -> None:
+    """Configure logging for the topdown-convert pipeline.
 
-    if log_dir is None:
-        log_dir = pathlib.Path.cwd()
-    else:
-        log_dir = pathlib.Path(log_dir)
+    If logging has already been configured, this function does nothing.
 
-    log_path = log_dir / log_filename
+    Parameters
+    ----------
+    log_dir : PathLike, optional
+        Directory where log files will be written. If None, uses the
+        current working directory. Ignored if `to_file` is False.
+    to_file : bool, default=True
+        If True, logs are written both to a file and to the console.
+        If False, logs are only streamed to the console.
+    filename : str, optional
+        Custom log filename. If None, defaults to
+        ``top-down-convert-YYYYDDMM.log``.
+    """
+    root_logger = logging.getLogger()
+    if root_logger.handlers:  # already configured → no-op
+        return
+
+    if filename is None:
+        dt_str = datetime.datetime.now().strftime("%Y%d%m")
+        filename = f"top-down-convert-{dt_str}.log"
+
+    handlers = [logging.StreamHandler()]
+
+    if to_file:
+        if log_dir is None:
+            log_dir = pathlib.Path.cwd()
+        else:
+            log_dir = pathlib.Path(log_dir)
+
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / filename
+        handlers.insert(0, logging.FileHandler(log_path, mode="w"))
 
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
+        format="%(asctime)s [%(levelname)s] [%(funcName)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[logging.FileHandler(log_path, mode="w"), logging.StreamHandler()],
+        handlers=handlers,
     )
 
 
@@ -65,15 +96,50 @@ def get_psms(msf_file_path: PathLike) -> pd.DataFrame:
         ``ParentProteinAccessions`` values filled as empty strings.
     """
     with sqlite3.connect(msf_file_path) as con:
-        dfs = [
-            pd.read_sql(f"SELECT * FROM {t}", con).assign(is_target=flag)
-            for t, flag in [
-                ("TargetProteoformSpectrumMatchs", True),
-                ("DecoyProteoformSpectrumMatchs", False),
-            ]
-        ]
-    psm_df = pd.concat(dfs, ignore_index=True)
-    psm_df["ParentProteinAccessions"] = psm_df["ParentProteinAccessions"].fillna("")
+        TargetProteoformSpectrumMatchs = pd.read_sql(
+            "SELECT * FROM TargetProteoformSpectrumMatchs", con
+        )
+        DecoyProteoformSpectrumMatchs = pd.read_sql(
+            "SELECT * FROM DecoyProteoformSpectrumMatchs", con
+        )
+
+        TargetProteoformSpectrumMatchs = TargetProteoformSpectrumMatchs.merge(
+            pd.read_sql(
+                """
+                SELECT
+                    TargetProteoformSpectrumMatchsID,
+                    MSnSpectrumInfoSpectrumID
+                FROM
+                    TargetProteoformSpectrumMatchsMSnSpectrumInfo
+                """,
+                con,
+            ),
+            left_on="ID",
+            right_on="TargetProteoformSpectrumMatchsID",
+        )
+
+        DecoyProteoformSpectrumMatchs = DecoyProteoformSpectrumMatchs.merge(
+            pd.read_sql(
+                """
+                SELECT
+                    DecoyProteoformSpectrumMatchsID,
+                    MSnSpectrumInfoSpectrumID
+                FROM
+                    DecoyProteoformSpectrumMatchsMSnSpectrumInfo
+                """,
+                con,
+            ),
+            left_on="ID",
+            right_on="DecoyProteoformSpectrumMatchsID",
+        )
+
+    psm_df = pd.concat(
+        [TargetProteoformSpectrumMatchs, DecoyProteoformSpectrumMatchs], 
+        ignore_index=True
+    )
+    
+    # The decoy tables doesn't populate this column
+    psm_df["is_target"] = ~psm_df["CScore"].isna()
     return psm_df
 
 
@@ -96,24 +162,7 @@ def get_target_ms_info(
         DataFrame of target PSMs with additional spectrum-level metadata merged.
     """
     with sqlite3.connect(msf_file_path) as con:
-        target_ms_info_id_df = pd.read_sql(
-            """
-            SELECT
-                TargetProteoformSpectrumMatchsID,
-                MSnSpectrumInfoSpectrumID
-            FROM
-                TargetProteoformSpectrumMatchsMSnSpectrumInfo
-            """,
-            con,
-        )
-
         ms_info_df = pd.read_sql("SELECT * FROM MSnSpectrumInfo", con)
-
-    target_df = target_df.merge(
-        target_ms_info_id_df,
-        left_on="ID",
-        right_on="TargetProteoformSpectrumMatchsID",
-    )
 
     target_df = target_df.merge(
         ms_info_df,
@@ -128,11 +177,11 @@ def get_target_ms_info(
 def get_filtered_targets(
     psm_df: pd.DataFrame,
     max_fdr: float = 0.01,
-    min_pep_len: int = 5,
-    max_pep_len: int = 100,
+    min_pep_len: Optional[int] = 5,
+    max_pep_len: Optional[int] = None,
 ) -> pd.DataFrame:
     """
-    Apply FDR and peptide length filtering to PSMs.
+    Apply FDR and (optional) peptide length filtering to PSMs.
 
     Parameters
     ----------
@@ -140,21 +189,25 @@ def get_filtered_targets(
         DataFrame containing target and decoy PSMs.
     max_fdr : float, default=0.01
         Maximum acceptable FDR (q-value).
-    min_pep_len : int, default=5
-        Minimum peptide sequence length.
-    max_pep_len : int, default=100
-        Maximum peptide sequence length.
+    min_pep_len : int, optional, default=5
+        Minimum peptide sequence length to retain. If None, no minimum is
+        applied.
+    max_pep_len : int, optional, default=None
+        Maximum peptide sequence length to retain. If None, no maximum i
+        applied.
 
     Returns
     -------
     pd.DataFrame
         Filtered DataFrame of target PSMs that pass FDR and length criteria.
     """
+    psm_df = psm_df.reset_index(drop=True)
+    psm_df["ParentProteinAccessions"] = psm_df["ParentProteinAccessions"].fillna("")
     psms = crema.read_txt(
         txt_files=psm_df,
         target_column="is_target",
-        spectrum_columns="ID",
-        score_columns="CScore",
+        spectrum_columns="MSnSpectrumInfoSpectrumID",
+        score_columns=SCORE_COLUMN,
         peptide_column="Sequence",
         protein_column="ParentProteinAccessions",
         protein_delim=",",
@@ -163,14 +216,71 @@ def get_filtered_targets(
     confidence = psms.assign_confidence(pep_fdr_type="psm-only", threshold="q-value")
     crema_df = confidence.confidence_estimates["psms"]
     crema_df = crema_df[crema_df["crema q-value"] <= max_fdr]
-    crema_df = crema_df[crema_df["Sequence"].str.len() >= min_pep_len]
-    crema_df = crema_df[crema_df["Sequence"].str.len() <= max_pep_len]
-
-    filtered_ids = set(crema_df["ID"])
-    filtered_df = psm_df[psm_df["is_target"]]
-    filtered_df = filtered_df[filtered_df["ID"].isin(filtered_ids)]
-
+    
+    if min_pep_len is not None:
+        crema_df = crema_df[crema_df["Sequence"].str.len() >= min_pep_len]
+        
+    if max_pep_len is not None:
+        crema_df = crema_df[crema_df["Sequence"].str.len() <= max_pep_len]
+        
+    filtered_df = psm_df.loc[crema_df.index]
     return filtered_df
+
+
+def run_ms_convert(raw_file: PathLike) -> pathlib.Path:
+    """
+    Convert a Thermo RAW file to mzML format using msconvert inside Apptainer.
+
+    Invokes the ``msconvert`` command wrapped in a Singularity/Apptainer
+    container. The RAW file is bind-mounted into the container and converted to
+    a compressed, peak-picked mzML file. Assumes the container file is at the
+    path ~/msconvert.sif if the envar MSCONVERT_SIF_PATH is not set.
+
+    Parameters
+    ----------
+    raw_file : PathLike
+        Path to the Thermo RAW file to convert.
+
+    Returns
+    -------
+    pathlib.Path
+        Path to the generated mzML file (same base name as the RAW file).
+    """
+    raw_file = pathlib.Path(raw_file)
+    raw_file_dir = raw_file.parent
+    mzml_file = raw_file.with_suffix(".mzML")
+    sif_path = pathlib.Path(MSCONVERT_SIF_PATH).expanduser().resolve()
+    logging.info(f"Converting {raw_file.name} to {mzml_file.name}")
+
+    cmd = [
+        "apptainer", "exec",
+        "-B", f"{raw_file_dir}:/data",
+        str(sif_path),
+        "wine", "msconvert",
+        f"/data/{raw_file.name}",
+        "--outdir", "/data",
+        "--verbose",
+        "--zlib",
+        "--mzML",
+        "--64",
+        "--filter", "peakPicking true 1-",
+    ]
+
+    logging.info("Running command: %s", " ".join(cmd))
+    process = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+    )
+
+    # Stream each line into logging
+    with process.stdout:
+        for line in process.stdout:
+            logging.info(line.strip())
+
+    retcode = process.wait()
+    if retcode != 0:
+        raise subprocess.CalledProcessError(retcode, cmd)
+
+    return mzml_file
 
 
 def get_filtered_mgf(msf_path: PathLike) -> pd.DataFrame:
@@ -187,9 +297,17 @@ def get_filtered_mgf(msf_path: PathLike) -> pd.DataFrame:
     pd.DataFrame
         Filtered PSM DataFrame used to generate the MGF file.
     """
+    setup_logging(to_file=False)
+    
     msf_path = pathlib.Path(msf_path)
     mzml_path = msf_path.with_suffix(".mzML")
     mgf_path = msf_path.with_suffix(".mgf")
+    raw_path = msf_path.with_suffix(".raw")
+    
+    if not mzml_path.is_file():
+        if not raw_path.is_file():
+            raise FileNotFoundError(f"No spectrum file found for {msf_path}")
+        run_ms_convert(raw_path)
 
     logging.info(f"Filtering MS run: {msf_path}")
     filtered_df = get_psms(msf_path)
@@ -247,69 +365,6 @@ def get_filtered_mgf(msf_path: PathLike) -> pd.DataFrame:
         tqdm.tqdm(mgf_spectra, desc="writing mgf"), output=str(mgf_path)
     )
     return filtered_df
-
-
-def run_ms_convert(raw_file: PathLike) -> pathlib.Path:
-    """
-    Convert a Thermo RAW file to mzML format using msconvert inside Apptainer.
-
-    Invokes the ``msconvert`` command wrapped in a Singularity/Apptainer
-    container. The RAW file is bind-mounted into the container and converted to
-    a compressed, peak-picked mzML file. Assumes the container file is at the
-    path ~/msconvert.sif if the envar MSCONVERT_SIF_PATH is not set.
-
-    Parameters
-    ----------
-    raw_file : PathLike
-        Path to the Thermo RAW file to convert.
-
-    Returns
-    -------
-    pathlib.Path
-        Path to the generated mzML file (same base name as the RAW file).
-    """
-    raw_file = pathlib.Path(raw_file)
-    raw_file_dir = raw_file.parent
-    sif_path = os.environ.get("MSCONVERT_SIF_PATH", "~/msconvert.sif")
-
-    cmd = [
-        "apptainer",
-        "exec",
-        "-B",
-        f"{raw_file_dir}:/data",
-        f"{sif_path}",
-        "wine",
-        "msconvert",
-        f"data/{raw_file.name}",
-        "--outdir",
-        "data",
-        "-verbose",
-        "--zlib",
-        "--mzML",
-        "--64",
-        "--filter",
-        "peakPicking true 1-",
-    ]
-    
-    logging.info("Running command: %s", " ".join(cmd))
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1
-    )
-
-    # Stream each line into logging
-    with process.stdout:
-        for line in process.stdout:
-            logging.info(line.strip())
-
-    retcode = process.wait()
-    if retcode != 0:
-        raise subprocess.CalledProcessError(retcode, cmd)
-
-    return raw_file.with_suffix(".mzML")
 
 
 def get_ms_run_ftp(
