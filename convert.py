@@ -410,6 +410,10 @@ def get_ms_run_ftp(
     msf_file = pathlib.Path(msf_file)
     ftp_path = msf_file.parent
     psm_data_table = None
+    
+    log_dir = output_dir / "logs"
+    log_dir.mkdir(exist_ok=True, parents=True)
+    setup_logging(log_dir=log_dir, filename=msf_file.with_suffix(".log").name)
 
     mgf_dir = output_dir / "mgf-data"
     mgf_dir.mkdir(parents=True, exist_ok=True)
