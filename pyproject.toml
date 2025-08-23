@@ -8,6 +8,7 @@ dependencies = [
     "crema-ms>=0.0.10",
     "fire>=0.7.1",
     "joblib>=1.5.1",
+    "pyarrow>=21.0.0",
     "pyteomics>=4.7.5",
     "tqdm>=4.67.1",
 ]
